@@ -1,200 +1,190 @@
-/*
- * ============================================================
- *  Estufa IoT — ESP32 com MQTT
- *  SENAI — Projeto Internet das Coisas
- * ============================================================
- *
- *  BIBLIOTECAS NECESSÁRIAS (instale pelo Library Manager da Arduino IDE):
- *    - PubSubClient  by Nick O'Leary   (MQTT)
- *    - ArduinoJson   by Benoit Blanchon
- *    - DHT sensor library  by Adafruit
- *    - Adafruit Unified Sensor  by Adafruit
- *
- *  TÓPICO MQTT (deve ser o mesmo configurado no site React):
- *    senai/estufa/iot/leituras
- *
- * ============================================================
- */
-
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <DHT.h>
 
-// ── Configurações Wi-Fi ──────────────────────────────────────────────────────
-const char* WIFI_SSID     = "SEU_WIFI_AQUI";       // ← Troque pelo nome da sua rede
-const char* WIFI_PASSWORD = "SUA_SENHA_AQUI";      // ← Troque pela sua senha
+// --- CONFIGURAÇÕES DE REDE ---
+const char* ssid     = "DIGITE_SUA_REDE";  // Nome exato da sua rede ou Wi-Fi do Celular
+const char* password = "DIGITE_SUA_SENHA"; // Senha da sua rede
 
-// ── Configurações MQTT (HiveMQ público — sem cadastro) ───────────────────────
-const char* MQTT_BROKER   = "broker.hivemq.com";   // Broker público gratuito
-const int   MQTT_PORT     = 1883;                  // Porta padrão MQTT (sem TLS)
-const char* MQTT_TOPIC    = "senai/estufa/iot/leituras"; // Mesmo tópico do site!
-const char* MQTT_CLIENT_ID = "ESP32-Estufa-001";   // Troque se tiver múltiplos ESP32
+// --- CONFIGURAÇÕES MQTT (Nuvem Gratuita e Ultrarrápida) ---
+const char* MQTT_BROKER = "broker.hivemq.com";
+const int   MQTT_PORT   = 1883;
+const char* MQTT_TOPIC  = "senai/estufa/iot/leituras";
 
-// ── Pinos dos sensores ───────────────────────────────────────────────────────
-#define DHT_PIN      4     // GPIO 4  — Sensor DHT22 (temperatura + umidade)
-#define DHT_TYPE     DHT22
-#define LDR_PIN      34    // GPIO 34 — Fotoresistor / LDR (luminosidade)
-#define WATER_PIN    35    // GPIO 35 — Sensor de nível d'água (analógico)
-#define PUMP_PIN     26    // GPIO 26 — Relé da bomba de irrigação
-#define FAN_PIN      27    // GPIO 27 — Relé do exaustor / ventoinha
+// --- MAPEAMENTO DOS PINOS MANTIDO (ESP32-S3) ---
+#define DHTPIN     10   // Pino de dados do DHT11
+#define DHTTYPE    DHT11
+#define LDRPIN     5    // Pino analógico do LDR
+#define WATERPIN   4    // Pino analógico do Potenciômetro
+#define LEDPIN     1    // Pino do LED (Simula Bomba de Irrigação)
+#define BUZZERPIN  46   // Pino Buzzer
 
-// ── Limites de controle automático ──────────────────────────────────────────
-#define TEMP_MAX     30.0  // °C — acima disso, o exaustor é acionado
-#define WATER_MIN    30    // %  — abaixo disso, a bomba é acionada
+#define SDA_PIN    8    // Pino I2C SDA da ESP32-S3
+#define SCL_PIN    9    // Pino I2C SCL da ESP32-S3
 
-// ── Intervalo de publicação ──────────────────────────────────────────────────
-#define PUBLISH_INTERVAL_MS  5000  // Publica dados a cada 5 segundos
+// --- CONFIGURAÇÃO DOS PERIFÉRICOS ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
 
-// ── Objetos ──────────────────────────────────────────────────────────────────
-DHT          dht(DHT_PIN, DHT_TYPE);
-WiFiClient   wifiClient;
-PubSubClient mqttClient(wifiClient);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
-unsigned long lastPublish = 0;
+// --- LIMITES DA ESTUFA PARA AUTOMAÇÃO ---
+const float TEMP_LIMITE = 30.0;     // Temperatura > 30°C dispara exaustor (Buzzer)
+const float TEMP_ABAIXO = 0.0;      // Temperatura < 0°C dispara exaustor (Buzzer)
+const int AGUA_LIMITE_BAIXO = 30;   // limite de água para acender o LED
 
-// ============================================================
-//  SETUP
-// ============================================================
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\n========================================");
-  Serial.println("  Estufa IoT — Iniciando...");
-  Serial.println("========================================");
+// --- GERENCIAMENTO DE TEMPOS SEM TRANCAR A PLACA ---
+unsigned long tempoUltimoLoop = 0;
+const unsigned long intervaloLeitura = 1000; // Lê sensores e publica MQTT a cada 1 segundo (1000ms)
 
-  // Configura os pinos de saída
-  pinMode(PUMP_PIN, OUTPUT);
-  pinMode(FAN_PIN,  OUTPUT);
-  digitalWrite(PUMP_PIN, LOW);  // Desliga bomba na inicialização
-  digitalWrite(FAN_PIN,  LOW);  // Desliga exaustor na inicialização
+unsigned long tempoUltimoMqttTentativa = 0;
 
-  // Inicia o sensor DHT
-  dht.begin();
+// Variáveis Globais
+float temp = 0.0;
+float umid = 0.0;
+int aguaPct = 0;
+int luz = 0;
 
-  // Conecta ao Wi-Fi
-  connectWiFi();
-
-  // Configura o cliente MQTT
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setBufferSize(512); // Buffer para mensagens JSON maiores
+// Reconexão Automática ao Broker MQTT sem travar a execução
+void verificarConexaoMQTT() {
+  if (!mqttClient.connected()) {
+    unsigned long agora = millis();
+    if (agora - tempoUltimoMqttTentativa >= 3000) {
+      tempoUltimoMqttTentativa = agora;
+      
+      String clientId = "ESP32S3-Estufa-" + String(random(0xffff), HEX);
+      Serial.print("Conectando ao Broker MQTT...");
+      
+      if (mqttClient.connect(clientId.c_str())) {
+        Serial.println(" CONECTADO COM SUCESSO!");
+      } else {
+        Serial.print(" Falhou, rc=");
+        Serial.println(mqttClient.state());
+      }
+    }
+  }
 }
 
-// ============================================================
-//  LOOP PRINCIPAL
-// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Inicialização dos pinos I2C específicos da ESP32-S3
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicialização do LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("   Estufa IoT   ");
+  lcd.setCursor(0, 1);
+  lcd.print(" Conectando... ");
+
+  // Inicialização dos Atuadores
+  pinMode(LEDPIN, OUTPUT);
+  digitalWrite(LEDPIN, LOW);
+  
+  // Configuração nativa de PWM para o Buzzer na ESP32-S3 (Evita travamentos)
+  ledcAttach(BUZZERPIN, 1000, 8); 
+  ledcWriteTone(BUZZERPIN, 0); // Inicia desligado
+
+  // Inicialização do DHT11
+  dht.begin();
+
+  // Inicialização do Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando ao WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Conectado!");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Sistema OK  ");
+  
+  // Configuração do servidor MQTT
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+}
+
 void loop() {
-  // Garante conexão MQTT ativa
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
+  // Garante reconexão Wi-Fi e MQTT transparentes
+  if (WiFi.status() == WL_CONNECTED) {
+    verificarConexaoMQTT();
   }
   mqttClient.loop();
 
-  // Publica leitura no intervalo configurado
-  unsigned long now = millis();
-  if (now - lastPublish >= PUBLISH_INTERVAL_MS) {
-    lastPublish = now;
-    lerEPublicar();
-  }
-}
+  unsigned long tempoAtual = millis();
 
-// ============================================================
-//  LER SENSORES E PUBLICAR VIA MQTT
-// ============================================================
-void lerEPublicar() {
-  // -- Temperatura e umidade (DHT22) --
-  float temperatura = dht.readTemperature();
-  float umidade     = dht.readHumidity();
+  // --- EXECUTADO A CADA 1 SEGUNDO (TEMPO REAL) ---
+  if (tempoAtual - tempoUltimoLoop >= intervaloLeitura) {
+    tempoUltimoLoop = tempoAtual;
 
-  if (isnan(temperatura) || isnan(umidade)) {
-    Serial.println("[ERRO] Falha na leitura do DHT22! Verifique a ligação.");
-    return;
-  }
+    // 1. LEITURA DOS SENSORES
+    float tempLida = dht.readTemperature();
+    float umidLida = dht.readHumidity();
 
-  // -- Nível do reservatório (0-4095 → 0-100%) --
-  // Sensor de nível analógico: mais água = maior tensão (ajuste se necessário)
-  int rawWater = analogRead(WATER_PIN);
-  int aguaPct  = map(rawWater, 0, 4095, 0, 100);
-  aguaPct      = constrain(aguaPct, 0, 100);
-
-  // -- Luminosidade (LDR → lux aproximado) --
-  // LDR: mais luz = maior resistência = menor tensão (depende do divisor de tensão)
-  int rawLDR = analogRead(LDR_PIN);
-  int luz    = map(rawLDR, 0, 4095, 0, 10000); // 0 a 10.000 lux (ajuste conforme seu sensor)
-
-  // -- Controle automático dos atuadores --
-  bool bombaLigada    = (aguaPct < WATER_MIN);     // Liga bomba se água < 30%
-  bool exaustorLigado = (temperatura > TEMP_MAX);  // Liga exaustor se temp > 30°C
-
-  digitalWrite(PUMP_PIN, bombaLigada    ? HIGH : LOW);
-  digitalWrite(FAN_PIN,  exaustorLigado ? HIGH : LOW);
-
-  // -- Monta o payload JSON --
-  // IMPORTANTE: os nomes dos campos DEVEM ser iguais aos do site React
-  StaticJsonDocument<256> doc;
-  doc["temperatura"]     = temperatura;
-  doc["umidade"]         = (int)umidade;
-  doc["aguaPct"]         = aguaPct;
-  doc["luz"]             = luz;
-  doc["bombaLigada"]     = bombaLigada;
-  doc["exaustorLigado"]  = exaustorLigado;
-
-  char payload[256];
-  serializeJson(doc, payload);
-
-  // -- Exibe no Monitor Serial --
-  Serial.println("----------------------------------------");
-  Serial.printf("  Temp:      %.1f °C\n",  temperatura);
-  Serial.printf("  Umidade:   %d %%\n",    (int)umidade);
-  Serial.printf("  Água:      %d %%\n",    aguaPct);
-  Serial.printf("  Luz:       %d lx\n",   luz);
-  Serial.printf("  Bomba:     %s\n",       bombaLigada    ? "LIGADA" : "desligada");
-  Serial.printf("  Exaustor:  %s\n",       exaustorLigado ? "LIGADO" : "desligado");
-  Serial.printf("  Payload:   %s\n",       payload);
-
-  // -- Publica no broker MQTT --
-  if (mqttClient.publish(MQTT_TOPIC, payload, false)) {
-    Serial.println("  [MQTT] ✓ Publicado com sucesso!");
-  } else {
-    Serial.println("  [MQTT] ✗ Falha ao publicar!");
-  }
-}
-
-// ============================================================
-//  CONEXÃO WI-FI
-// ============================================================
-void connectWiFi() {
-  Serial.printf("[Wi-Fi] Conectando a: %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    if (++tentativas > 30) {
-      Serial.println("\n[Wi-Fi] ERRO: Não foi possível conectar. Reiniciando...");
-      ESP.restart();
+    if (!isnan(tempLida) && !isnan(umidLida)) {
+      temp = tempLida;
+      umid = umidLida;
     }
-  }
 
-  Serial.println();
-  Serial.printf("[Wi-Fi] ✓ Conectado!  IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("[Wi-Fi]   RSSI: %d dBm\n", WiFi.RSSI());
-}
+    int leituraBrutaAgua = analogRead(WATERPIN);
+    aguaPct = map(leituraBrutaAgua, 0, 4095, 0, 100);
+    aguaPct = constrain(aguaPct, 0, 100);
 
-// ============================================================
-//  RECONEXÃO MQTT
-// ============================================================
-void reconnectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.printf("[MQTT] Conectando ao broker %s:%d...", MQTT_BROKER, MQTT_PORT);
+    luz = analogRead(LDRPIN);
 
-    if (mqttClient.connect(MQTT_CLIENT_ID)) {
-      Serial.println(" ✓ Conectado!");
+    // 2. LÓGICA DE AUTOMAÇÃO (Bomba e Buzzer)
+    if (aguaPct < AGUA_LIMITE_BAIXO) {
+      digitalWrite(LEDPIN, HIGH); // Liga bomba/LED
     } else {
-      Serial.printf(" ✗ Falhou (rc=%d). Tentando novamente em 5s...\n", mqttClient.state());
-      delay(5000);
+      digitalWrite(LEDPIN, LOW);  // Desliga
+    }
+
+    if (temp > TEMP_LIMITE) {
+      ledcWriteTone(BUZZERPIN, 1000); // Alarme de calor
+    } else if (temp < TEMP_ABAIXO) {
+      ledcWriteTone(BUZZERPIN, 600);  // Alarme de frio
+    } else {
+      ledcWriteTone(BUZZERPIN, 0);    // Temperatura OK
+    }
+
+    // 3. EXIBIÇÃO NO LCD (Com limpeza de resíduos)
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print(temp, 1);
+    lcd.print((char)223);
+    lcd.print("C U:");
+    lcd.print(umid, 0);
+    lcd.print("%   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Agua:");
+    lcd.print(aguaPct);
+    lcd.print("% L:");
+    lcd.print(luz);
+    lcd.print("    ");
+
+    // 4. TRANSMISSÃO SERIAL (DEBUG)
+    Serial.printf("[ESP32-S3] Temp: %.1f°C | Umid: %.1f%% | Agua: %d%% | Luz: %d\n", 
+                  temp, umid, aguaPct, luz);
+
+    // 5. ENVIO DOS DADOS VIA MQTT (Super Rápido)
+    if (mqttClient.connected()) {
+      String payload = "{";
+      payload += "\"temperatura\":" + String(temp, 1) + ",";
+      payload += "\"umidade\":"     + String(umid, 1) + ",";
+      payload += "\"nivelAgua\":"   + String(aguaPct) + ",";
+      payload += "\"aguaPct\":"     + String(aguaPct) + ",";
+      payload += "\"luminosidade\":" + String(luz)     + ",";
+      payload += "\"luz\":"         + String(luz);
+      payload += "}";
+
+      mqttClient.publish(MQTT_TOPIC, payload.c_str());
     }
   }
 }

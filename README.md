@@ -221,13 +221,6 @@ A ESP32-S3 publica as leituras em formato JSON padronizado:
 
 ---
 
-## Backend & Banco de Dados (Opcional para Histórico)
-
-* Node.js / Express
-* PostgreSQL
-* Drizzle ORM
-
----
 
 # 🚀 Como Executar o Firmware
 

@@ -1,0 +1,226 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// --- CONFIGURAÇÕES DE REDE ---
+const char* ssid     = "DIGITE_SUA_REDE";  
+const char* password = "DIGITE_SUA_SENHA"; 
+
+// --- CONFIGURAÇÕES MQTT ---
+const char* MQTT_BROKER = "broker.hivemq.com";
+const int   MQTT_PORT   = 1883;
+const char* MQTT_TOPIC  = "senai/estufa/iot/leituras";
+
+// --- MAPEAMENTO DOS PINOS (ESP32-S3) ---
+#define DHTPIN     10   
+#define DHTTYPE    DHT11
+#define LDRPIN     5    
+#define WATERPIN   4    
+#define LEDPIN     1    
+#define BUZZERPIN  46   
+
+#define SDA_PIN    8    
+#define SCL_PIN    9    
+
+// --- CONFIGURAÇÃO DOS PERIFÉRICOS ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// --- LIMITES DA ESTUFA PARA AUTOMAÇÃO ---
+const float TEMP_LIMITE = 30.0;     
+const float TEMP_ABAIXO = 0.0;      
+const int AGUA_LIMITE_BAIXO = 30;   
+
+// --- GERENCIAMENTO DE TEMPOS ---
+unsigned long tempoUltimoLoop = 0;
+const unsigned long intervaloLeitura = 1000; 
+
+unsigned long tempoUltimoMqttTentativa = 0;
+unsigned long tempoUltimoWifiTentativa = 0;
+
+// Variáveis Globais
+float temp = 0.0;
+float umid = 0.0;
+int aguaPct = 0;
+int luz = 0;
+
+// Reconexão Automática ao Wi-Fi sem travar o código
+void verificarConexaoWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long agora = millis();
+    if (agora - tempoUltimoWifiTentativa >= 5000) { // Tenta reconectar a cada 5 segundos
+      tempoUltimoWifiTentativa = agora;
+      Serial.println("[Wi-Fi] Tentando reconectar ao Wi-Fi...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+  }
+}
+
+// Reconexão Automática ao Broker MQTT sem travar a execução
+void verificarConexaoMQTT() {
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+    unsigned long agora = millis();
+    if (agora - tempoUltimoMqttTentativa >= 3000) {
+      tempoUltimoMqttTentativa = agora;
+      
+      String clientId = "ESP32S3-Estufa-" + String(random(0xffff), HEX);
+      Serial.print("[MQTT] Conectando ao Broker MQTT...");
+      
+      if (mqttClient.connect(clientId.c_str())) {
+        Serial.println(" CONECTADO COM SUCESSO!");
+      } else {
+        Serial.print(" Falhou, rc=");
+        Serial.println(mqttClient.state());
+      }
+    }
+  }
+}
+
+// Função para suavizar leituras analógicas (Média Móvel de 4 amostras)
+int lerAnalogicoSuave(int pino) {
+  int soma = 0;
+  for(int i = 0; i < 4; i++) {
+    soma += analogRead(pino);
+    delay(5); // Pequeno intervalo para estabilização do ADC
+  }
+  return soma / 4;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Inicialização do barramento I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicialização do LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("   Estufa IoT   ");
+  lcd.setCursor(0, 1);
+  lcd.print(" Conectando... ");
+
+  // Inicialização dos Atuadores
+  pinMode(LEDPIN, OUTPUT);
+  digitalWrite(LEDPIN, LOW);
+  
+  // Configuração de PWM para o Buzzer
+  ledcAttach(BUZZERPIN, 1000, 8); 
+  ledcWriteTone(BUZZERPIN, 0); 
+
+  // Inicialização do DHT11
+  dht.begin();
+
+  // Configuração ampliada do buffer para payloads JSON maiores
+  mqttClient.setBufferSize(256);
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+
+  // Inicialização do Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando ao WiFi");
+  
+  // Bloqueio inicial aceitável apenas no setup
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(300);
+    Serial.print(".");
+    tentativas++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Conectado!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("  Sistema OK  ");
+  } else {
+    Serial.println("\nFalha inicial do WiFi. O sistema iniciará em modo offline.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(" Modo Offline ");
+  }
+}
+
+void loop() {
+  // Gerenciamento de conexões em segundo plano
+  verificarConexaoWiFi();
+  verificarConexaoMQTT();
+  mqttClient.loop();
+
+  unsigned long tempoAtual = millis();
+
+  // --- EXECUTADO A CADA 1 SEGUNDO ---
+  if (tempoAtual - tempoUltimoLoop >= intervaloLeitura) {
+    tempoUltimoLoop = tempoAtual;
+
+    // 1. LEITURA DOS SENSORES (Com filtro analógico)
+    float tempLida = dht.readTemperature();
+    float umidLida = dht.readHumidity();
+
+    if (!isnan(tempLida) && !isnan(umidLida)) {
+      temp = tempLida;
+      umid = umidLida;
+    }
+
+    int leituraBrutaAgua = lerAnalogicoSuave(WATERPIN);
+    aguaPct = map(leituraBrutaAgua, 0, 4095, 0, 100);
+    aguaPct = constrain(aguaPct, 0, 100);
+
+    luz = lerAnalogicoSuave(LDRPIN);
+
+    // 2. LÓGICA DE AUTOMAÇÃO
+    if (aguaPct < AGUA_LIMITE_BAIXO) {
+      digitalWrite(LEDPIN, HIGH); 
+    } else {
+      digitalWrite(LEDPIN, LOW);  
+    }
+
+    if (temp > TEMP_LIMITE) {
+      ledcWriteTone(BUZZERPIN, 1000); 
+    } else if (temp < TEMP_ABAIXO) {
+      ledcWriteTone(BUZZERPIN, 600);  
+    } else {
+      ledcWriteTone(BUZZERPIN, 0);    
+    }
+
+    // 3. EXIBIÇÃO NO LCD
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print(temp, 1);
+    lcd.print((char)223);
+    lcd.print("C U:");
+    lcd.print(umid, 0);
+    lcd.print("%   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Agua:");
+    lcd.print(aguaPct);
+    lcd.print("% L:");
+    lcd.print(luz);
+    lcd.print("    ");
+
+    // 4. TRANSMISSÃO SERIAL (DEBUG)
+    Serial.printf("[ESP32-S3] Temp: %.1f°C | Umid: %.1f%% | Agua: %d%% | Luz: %d | RSSI: %d dBm\n", 
+                  temp, umid, aguaPct, luz, (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0);
+
+    // 5. ENVIO DOS DADOS VIA MQTT
+    if (mqttClient.connected()) {
+      String payload = "{";
+      payload += "\"temperatura\":" + String(temp, 1) + ",";
+      payload += "\"umidade\":"     + String(umid, 1) + ",";
+      payload += "\"nivelAgua\":"   + String(aguaPct) + ",";
+      payload += "\"aguaPct\":"     + String(aguaPct) + ",";
+      payload += "\"luminosidade\":" + String(luz)     + ",";
+      payload += "\"luz\":"         + String(luz)     + ",";
+      payload += "\"wifi_rssi\":"   + String(WiFi.RSSI());
+      payload += "}";
+
+      mqttClient.publish(MQTT_TOPIC, payload.c_str());
+    }
+  }
+}
